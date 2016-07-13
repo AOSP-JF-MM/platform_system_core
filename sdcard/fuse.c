@@ -18,6 +18,12 @@
 
 #include "fuse.h"
 
+/* FUSE_CANONICAL_PATH is not currently upstreamed */
+#define FUSE_CANONICAL_PATH 2016
+
+#define PROP_SDCARDFS_DEVICE "ro.sys.sdcardfs"
+#define PROP_SDCARDFS_USER "persist.sys.sdcardfs"
+
 #define FUSE_UNKNOWN_INO 0xffffffff
 
 /* Pseudo-error constant used to indicate that no fuse status is needed
@@ -113,7 +119,7 @@ static ssize_t get_node_path_locked(struct node* node, char* buf, size_t bufsize
 
     ssize_t pathlen = 0;
     if (node->parent && node->graft_path == NULL) {
-        pathlen = get_node_path_locked(node->parent, buf, bufsize - namelen - 2);
+        pathlen = get_node_path_locked(node->parent, buf, bufsize - namelen - 1);
         if (pathlen < 0) {
             return -1;
         }
@@ -991,13 +997,7 @@ static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
     }
     out.fh = ptr_to_id(h);
     out.open_flags = 0;
-
-#ifdef FUSE_STACKED_IO
-    out.lower_fd = h->fd;
-#else
     out.padding = 0;
-#endif
-
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
 }
@@ -1161,13 +1161,7 @@ static int handle_opendir(struct fuse* fuse, struct fuse_handler* handler,
     }
     out.fh = ptr_to_id(h);
     out.open_flags = 0;
-
-#ifdef FUSE_STACKED_IO
-    out.lower_fd = -1;
-#else
     out.padding = 0;
-#endif
-
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
 }
@@ -1249,17 +1243,41 @@ static int handle_init(struct fuse* fuse, struct fuse_handler* handler,
     out.major = FUSE_KERNEL_VERSION;
     out.max_readahead = req->max_readahead;
     out.flags = FUSE_ATOMIC_O_TRUNC | FUSE_BIG_WRITES;
-
-#ifdef FUSE_STACKED_IO
-    out.flags |= FUSE_STACKED_IO;
-#endif
-
     out.max_background = 32;
     out.congestion_threshold = 32;
     out.max_write = MAX_WRITE;
     fuse_reply(fuse, hdr->unique, &out, fuse_struct_size);
     return NO_STATUS;
 }
+
+static int handle_canonical_path(struct fuse* fuse, struct fuse_handler* handler,
+        const struct fuse_in_header *hdr)
+{
+    struct node* node;
+    char path[PATH_MAX];
+    int len;
+
+    pthread_mutex_lock(&fuse->global->lock);
+    node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
+            path, sizeof(path));
+    TRACE("[%d] CANONICAL_PATH @ %" PRIx64 " (%s)\n", handler->token, hdr->nodeid,
+        node ? node->name : "?");
+    pthread_mutex_unlock(&fuse->global->lock);
+
+    if (!node) {
+        return -ENOENT;
+    }
+    if (!check_caller_access_to_node(fuse, hdr, node, R_OK)) {
+        return -EACCES;
+    }
+    len = strlen(path);
+    if (len + 1 > PATH_MAX)
+        len = PATH_MAX - 1;
+    path[PATH_MAX - 1] = 0;
+    fuse_reply(fuse, hdr->unique, path, len + 1);
+    return NO_STATUS;
+}
+
 
 static int handle_fuse_request(struct fuse *fuse, struct fuse_handler* handler,
         const struct fuse_in_header *hdr, const void *data, size_t data_len)
@@ -1374,6 +1392,10 @@ static int handle_fuse_request(struct fuse *fuse, struct fuse_handler* handler,
     case FUSE_INIT: { /* init_in -> init_out */
         const struct fuse_init_in *req = data;
         return handle_init(fuse, handler, hdr, req);
+    }
+
+    case FUSE_CANONICAL_PATH: { /* nodeid -> bytez[] */
+        return handle_canonical_path(fuse, handler, hdr);
     }
 
     default: {
